@@ -1,0 +1,41 @@
+mode: training
+
+base_lm:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  device: cuda
+  max_new_tokens: 256
+  temperature: 0.7
+
+diff_lm:
+  kind: gaussian
+
+langevin:
+  K: 20
+  step_size: 0.01
+  tangent_project: true
+
+span_select:
+  kind: answer
+  num_spans: 1
+
+task:
+  kind: toy
+  variant: digit_shift
+  num_tasks: 2000
+  seed: 0
+
+reward:
+  kind: toy_string
+
+training:
+  num_outer_steps: 2000
+  lr: 1.0e-5
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  grad_clip: 1.0
+  train_base_lm: true
+  train_diff_lm: false
+  train_critic: false
+  critic_hidden: 256
+  save_every: 200

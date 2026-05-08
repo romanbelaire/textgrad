@@ -1,0 +1,6 @@
+difftg_env/
+outputs/
+*.out
+hf_api
+.env
+.env.*

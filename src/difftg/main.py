@@ -1,0 +1,146 @@
+"""DiffTG CLI.
+
+Usage:
+    python -m src.difftg.main <config.yaml> <output_dir>
+"""
+from __future__ import annotations
+
+import json
+import random
+import sys
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from .base_lm import BaseLM
+from .config import Config, load_config
+from .diff_lm import build_diff_lm
+from .difftg_step import difftg_step
+from .reward import build_reward
+from .span_select import build_selector
+from .tasks import build_tasks
+
+
+def _seed_all(seed: int) -> torch.Generator:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    g = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu")
+    g.manual_seed(seed)
+    return g
+
+
+def _result_to_record(res) -> dict:
+    return {
+        "task_idx": res.task_idx,
+        "prompt": res.traj.prompt,
+        "gen_text_orig": res.traj.gen_text,
+        "gen_text_final": res.final_gen_text,
+        "R_orig": res.R_orig,
+        "R_final": res.R_final,
+        "delta_R_total": res.R_final - res.R_orig,
+        "attempts": [asdict(a) for a in res.attempts],
+    }
+
+
+def run_inference(cfg: Config, out_dir: Path) -> None:
+    g = _seed_all(cfg.task.seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base_lm = BaseLM(cfg.base_lm)
+    diff_lm = build_diff_lm(cfg.diff_lm, base_lm)
+    selector = build_selector(cfg.span_select, base_lm, cfg.task.seed)
+    reward_fn = build_reward(cfg.reward)
+    tasks = build_tasks(cfg.task)
+
+    results_path = out_dir / "results.jsonl"
+    summary_path = out_dir / "summary.json"
+
+    t0 = time.time()
+    r_orig_sum = 0.0
+    r_final_sum = 0.0
+    n_attempts = 0
+    n_accepted = 0
+    cos_sum = 0.0
+    with open(results_path, "w") as f:
+        for i, task in enumerate(tasks):
+            res = difftg_step(
+                base_lm=base_lm,
+                diff_lm=diff_lm,
+                selector=selector,
+                reward_fn=reward_fn,
+                task=task,
+                langevin_cfg=cfg.langevin,
+                num_spans=cfg.span_select.num_spans,
+                task_idx=i,
+                generator=g,
+            )
+            f.write(json.dumps(_result_to_record(res)) + "\n")
+            f.flush()
+            r_orig_sum += res.R_orig
+            r_final_sum += res.R_final
+            for a in res.attempts:
+                n_attempts += 1
+                if a.accepted:
+                    n_accepted += 1
+                cos_sum += a.cos_final
+            if (i + 1) % 10 == 0 or i + 1 == len(tasks):
+                print(
+                    f"[{i + 1}/{len(tasks)}] "
+                    f"mean_R_orig={r_orig_sum / (i + 1):.4f} "
+                    f"mean_R_final={r_final_sum / (i + 1):.4f} "
+                    f"accept_rate={(n_accepted / max(n_attempts, 1)):.3f}",
+                    flush=True,
+                )
+
+    summary = {
+        "num_tasks": len(tasks),
+        "mean_R_orig": r_orig_sum / max(len(tasks), 1),
+        "mean_R_final": r_final_sum / max(len(tasks), 1),
+        "mean_delta_R": (r_final_sum - r_orig_sum) / max(len(tasks), 1),
+        "num_attempts": n_attempts,
+        "accept_rate": n_accepted / max(n_attempts, 1),
+        "mean_cos_z0_zK": cos_sum / max(n_attempts, 1),
+        "wall_seconds": time.time() - t0,
+        "config": {
+            "base_lm": asdict(cfg.base_lm),
+            "diff_lm": asdict(cfg.diff_lm),
+            "langevin": asdict(cfg.langevin),
+            "span_select": asdict(cfg.span_select),
+            "task": asdict(cfg.task),
+            "reward": asdict(cfg.reward),
+        },
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Wrote {results_path} and {summary_path}", flush=True)
+
+
+def run_training(cfg: Config, out_dir: Path) -> None:
+    if cfg.training is None:
+        raise ValueError("Training mode requires a `training:` config block.")
+    from .trainer import run as trainer_run
+    trainer_run(cfg, out_dir)
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = argv if argv is not None else sys.argv[1:]
+    if len(argv) != 2:
+        raise ValueError(f"Usage: python -m src.difftg.main <config.yaml> <output_dir>; got {argv}")
+    cfg = load_config(argv[0])
+    out_dir = Path(argv[1])
+    if cfg.mode == "inference":
+        run_inference(cfg, out_dir)
+    elif cfg.mode == "training":
+        run_training(cfg, out_dir)
+    else:
+        raise ValueError(f"Unknown mode: {cfg.mode!r}")
+
+
+if __name__ == "__main__":
+    main()

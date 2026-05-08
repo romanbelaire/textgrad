@@ -1,0 +1,22 @@
+mode: inference
+base_lm:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  device: cuda
+  max_new_tokens: 256
+  temperature: 0.0
+diff_lm:
+  kind: gaussian
+langevin:
+  K: 5
+  step_size: 0.01
+  tangent_project: true
+span_select:
+  kind: answer
+  num_spans: 1
+task:
+  kind: toy
+  variant: digit_shift
+  num_tasks: 200
+  seed: 0
+reward:
+  kind: toy_string

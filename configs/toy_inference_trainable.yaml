@@ -1,0 +1,33 @@
+mode: inference
+
+base_lm:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  device: cuda
+  max_new_tokens: 256
+  temperature: 0.0
+
+diff_lm:
+  kind: trainable
+  d_model: 1536
+  n_layers: 4
+  n_heads: 8
+  t_max: 50
+  ckpt_path: outputs/diff_lm_ckpts/trainable_digit_shift.pt
+
+langevin:
+  K: 20
+  step_size: 0.01
+  tangent_project: true
+
+span_select:
+  kind: answer
+  num_spans: 1
+
+task:
+  kind: toy
+  variant: digit_shift
+  num_tasks: 200
+  seed: 1
+
+reward:
+  kind: toy_string
