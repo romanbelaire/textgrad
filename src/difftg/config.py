@@ -64,6 +64,9 @@ class TaskConfig:
     variant: str | None = None
     # gsm8k-only
     split: str | None = None
+    # Batched answer-marker repair: first generate this many tasks, then one
+    # `batch_repair_answer_markers` for failures (answer span only).
+    inference_chunk_size: int = 128
 
 
 @dataclass(frozen=True)
@@ -105,13 +108,15 @@ def _build(cls, data: dict[str, Any]):
 def load_config(path: str | Path) -> Config:
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
+    task_raw = dict(raw["task"])
+    task_raw.setdefault("inference_chunk_size", 128)
     return Config(
         mode=raw["mode"],
         base_lm=_build(BaseLMConfig, raw["base_lm"]),
         diff_lm=_build(DiffLMConfig, raw["diff_lm"]),
         langevin=_build(LangevinConfig, raw["langevin"]),
         span_select=_build(SpanSelectConfig, raw["span_select"]),
-        task=_build(TaskConfig, raw["task"]),
+        task=_build(TaskConfig, task_raw),
         reward=_build(RewardConfig, raw["reward"]),
         training=_build(TrainingConfig, raw["training"]) if "training" in raw else None,
     )

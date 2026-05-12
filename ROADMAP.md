@@ -4,6 +4,9 @@ Living document. Update the Status column of each table as experiments are
 run. Columns are: `id` (stable handle), `status` (pending / running / done /
 blocked), `owner`, and `notes / result hash`.
 
+# Current status
+The method doesn't yet produce meaningful changes in toy settings, most likely because the latent space step size is not enough to overcome the argmax token decoding/discretization. Upon further thinking, it is also a problem that the embedding space (and therefore the latent step direction) is dependent on the learned representation of the LM, so the end version of this gradient projection model will be non-transferable. Lastly, the motivation of this work is unclear. I started looking into it because the textgrad "textual gradients" irked me as unprincipled speculation, but other than that I do not have a clear problem to address, nor do I currently have an implied second order problem that this project would lead into.
+
 ## 0. Research thesis
 
 We claim that reward-grounded, representation-space perturbations (a

@@ -20,7 +20,7 @@ from .config import Config, load_config
 from .diff_lm import build_diff_lm
 from .difftg_step import difftg_step
 from .reward import build_reward
-from .span_select import build_selector
+from .span_select import build_selector, gen_text_has_answer_span_marker
 from .tasks import build_tasks
 
 
@@ -48,6 +48,62 @@ def _result_to_record(res) -> dict:
     }
 
 
+def _run_inference_loop(
+    f,
+    base_lm: BaseLM,
+    diff_lm,
+    selector,
+    reward_fn,
+    tasks: list,
+    *,
+    task_indices: list[int],
+    trajs: list,
+    g: torch.Generator,
+    cfg: Config,
+    r_orig_sum: float,
+    r_final_sum: float,
+    n_attempts: int,
+    n_accepted: int,
+    cos_sum: float,
+    processed_count: int,
+    total_tasks: int,
+) -> tuple[float, float, int, int, float]:
+    """Write one result per task; `trajs[k]` pairs with `tasks[k]` and `task_indices[k]`."""
+    for k, task in enumerate(tasks):
+        i = task_indices[k]
+        res = difftg_step(
+            base_lm=base_lm,
+            diff_lm=diff_lm,
+            selector=selector,
+            reward_fn=reward_fn,
+            task=task,
+            langevin_cfg=cfg.langevin,
+            num_spans=cfg.span_select.num_spans,
+            task_idx=i,
+            generator=g,
+            traj=trajs[k],
+        )
+        f.write(json.dumps(_result_to_record(res)) + "\n")
+        f.flush()
+        r_orig_sum += res.R_orig
+        r_final_sum += res.R_final
+        for a in res.attempts:
+            n_attempts += 1
+            if a.accepted:
+                n_accepted += 1
+            cos_sum += a.cos_final
+        processed_count += 1
+        if processed_count % 10 == 0 or processed_count == total_tasks:
+            print(
+                f"[{processed_count}/{total_tasks}] "
+                f"mean_R_orig={r_orig_sum / processed_count:.4f} "
+                f"mean_R_final={r_final_sum / processed_count:.4f} "
+                f"accept_rate={(n_accepted / max(n_attempts, 1)):.3f}",
+                flush=True,
+            )
+    return r_orig_sum, r_final_sum, n_attempts, n_accepted, cos_sum
+
+
 def run_inference(cfg: Config, out_dir: Path) -> None:
     g = _seed_all(cfg.task.seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -67,36 +123,77 @@ def run_inference(cfg: Config, out_dir: Path) -> None:
     n_attempts = 0
     n_accepted = 0
     cos_sum = 0.0
+    total_tasks = len(tasks)
+    processed_count = 0
+
     with open(results_path, "w") as f:
-        for i, task in enumerate(tasks):
-            res = difftg_step(
-                base_lm=base_lm,
-                diff_lm=diff_lm,
-                selector=selector,
-                reward_fn=reward_fn,
-                task=task,
-                langevin_cfg=cfg.langevin,
-                num_spans=cfg.span_select.num_spans,
-                task_idx=i,
-                generator=g,
-            )
-            f.write(json.dumps(_result_to_record(res)) + "\n")
-            f.flush()
-            r_orig_sum += res.R_orig
-            r_final_sum += res.R_final
-            for a in res.attempts:
-                n_attempts += 1
-                if a.accepted:
-                    n_accepted += 1
-                cos_sum += a.cos_final
-            if (i + 1) % 10 == 0 or i + 1 == len(tasks):
-                print(
-                    f"[{i + 1}/{len(tasks)}] "
-                    f"mean_R_orig={r_orig_sum / (i + 1):.4f} "
-                    f"mean_R_final={r_final_sum / (i + 1):.4f} "
-                    f"accept_rate={(n_accepted / max(n_attempts, 1)):.3f}",
-                    flush=True,
+        if cfg.span_select.kind == "answer":
+            chunk = max(1, cfg.task.inference_chunk_size)
+            offset = 0
+            while offset < total_tasks:
+                end = min(offset + chunk, total_tasks)
+                chunk_tasks = tasks[offset:end]
+                task_indices = list(range(offset, end))
+                trajs = [base_lm.generate(t.prompt) for t in chunk_tasks]
+                need_repair = [
+                    trajs[j]
+                    for j in range(len(trajs))
+                    if not gen_text_has_answer_span_marker(trajs[j].gen_text)
+                ]
+                if need_repair:
+                    base_lm.batch_repair_answer_markers(need_repair)
+                r_orig_sum, r_final_sum, n_attempts, n_accepted, cos_sum = _run_inference_loop(
+                    f,
+                    base_lm,
+                    diff_lm,
+                    selector,
+                    reward_fn,
+                    chunk_tasks,
+                    task_indices=task_indices,
+                    trajs=trajs,
+                    g=g,
+                    cfg=cfg,
+                    r_orig_sum=r_orig_sum,
+                    r_final_sum=r_final_sum,
+                    n_attempts=n_attempts,
+                    n_accepted=n_accepted,
+                    cos_sum=cos_sum,
+                    processed_count=processed_count,
+                    total_tasks=total_tasks,
                 )
+                processed_count += len(chunk_tasks)
+                offset = end
+        else:
+            for i, task in enumerate(tasks):
+                res = difftg_step(
+                    base_lm=base_lm,
+                    diff_lm=diff_lm,
+                    selector=selector,
+                    reward_fn=reward_fn,
+                    task=task,
+                    langevin_cfg=cfg.langevin,
+                    num_spans=cfg.span_select.num_spans,
+                    task_idx=i,
+                    generator=g,
+                )
+                f.write(json.dumps(_result_to_record(res)) + "\n")
+                f.flush()
+                r_orig_sum += res.R_orig
+                r_final_sum += res.R_final
+                for a in res.attempts:
+                    n_attempts += 1
+                    if a.accepted:
+                        n_accepted += 1
+                    cos_sum += a.cos_final
+                processed_count = i + 1
+                if processed_count % 10 == 0 or processed_count == total_tasks:
+                    print(
+                        f"[{processed_count}/{total_tasks}] "
+                        f"mean_R_orig={r_orig_sum / processed_count:.4f} "
+                        f"mean_R_final={r_final_sum / processed_count:.4f} "
+                        f"accept_rate={(n_accepted / max(n_attempts, 1)):.3f}",
+                        flush=True,
+                    )
 
     summary = {
         "num_tasks": len(tasks),

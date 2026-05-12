@@ -14,6 +14,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import BaseLMConfig
 
+# Batched repair when `[ANSWER]` is missing: force this suffix then generate.
+ANSWER_REPAIR_SUFFIX = "Final answer: [ANSWER]"
+ANSWER_REPAIR_MAX_NEW_TOKENS = 20
+
 _ANSWER_TAG_SYSTEM_INSTRUCTION = (
     "Always wrap the final answer in [ANSWER] and [/ANSWER] tags. "
     "Use exactly one tagged final answer segment."
@@ -27,11 +31,16 @@ class Trajectory:
     `prompt` is the user-role content passed in. `chat_prompt` is the exact
     string fed to the model after applying the chat template. `gen_text` is the
     decoded generation (no special tokens).
+
+    `gen_token_ids` is the assistant-only token ids from the last `generate` or
+    repair pass (1-D CPU long tensor). Used for batched answer-suffix repair so
+    continuation matches the model's tokenization.
     """
 
     prompt: str
     chat_prompt: str
     gen_text: str
+    gen_token_ids: torch.Tensor | None = None
 
 
 class BaseLM:
@@ -86,7 +95,68 @@ class BaseLM:
         )
         gen_ids = out[0, ids.size(1):]
         gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-        return Trajectory(prompt=prompt, chat_prompt=chat_prompt, gen_text=gen_text)
+        return Trajectory(
+            prompt=prompt,
+            chat_prompt=chat_prompt,
+            gen_text=gen_text,
+            gen_token_ids=gen_ids.detach().cpu(),
+        )
+
+    @torch.no_grad()
+    def batch_repair_answer_markers(self, trajs: list[Trajectory]) -> None:
+        """Append tokenized `ANSWER_REPAIR_SUFFIX` and generate `ANSWER_REPAIR_MAX_NEW_TOKENS` tokens.
+
+        Updates each trajectory's `gen_text` and `gen_token_ids` in place. One
+        batched `model.generate` call for the whole list (left-padded).
+        """
+        if not trajs:
+            return
+        device = self.device
+        for traj in trajs:
+            if traj.gen_token_ids is None:
+                raise ValueError(
+                    "batch_repair_answer_markers requires Trajectory.gen_token_ids from BaseLM.generate."
+                )
+
+        suffix_ids = torch.tensor(
+            self.tokenizer(ANSWER_REPAIR_SUFFIX, add_special_tokens=False).input_ids,
+            dtype=torch.long,
+            device=device,
+        )
+
+        seqs: list[torch.Tensor] = []
+        for traj in trajs:
+            prompt_ids = self.tokenizer(
+                traj.chat_prompt, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0].to(device)
+            gen_ids = traj.gen_token_ids.to(device)
+            seqs.append(torch.cat([prompt_ids, gen_ids, suffix_ids], dim=0))
+
+        max_len = max(s.size(0) for s in seqs)
+        pad_id = self.tokenizer.pad_token_id
+        batch_input = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=device)
+        attn = torch.zeros((len(seqs), max_len), dtype=torch.long, device=device)
+        for bi, s in enumerate(seqs):
+            L = s.size(0)
+            batch_input[bi, max_len - L :] = s
+            attn[bi, max_len - L :] = 1
+
+        do_sample = self.cfg.temperature > 0.0
+        out = self.model.generate(
+            batch_input,
+            attention_mask=attn,
+            max_new_tokens=ANSWER_REPAIR_MAX_NEW_TOKENS,
+            do_sample=do_sample,
+            temperature=self.cfg.temperature if do_sample else 1.0,
+            pad_token_id=pad_id,
+        )
+
+        for bi, traj in enumerate(trajs):
+            gen_ids = traj.gen_token_ids.to(device)
+            new_toks = out[bi, max_len:]
+            full_gen = torch.cat([gen_ids, suffix_ids, new_toks], dim=0)
+            traj.gen_token_ids = full_gen.detach().cpu()
+            traj.gen_text = self.tokenizer.decode(full_gen, skip_special_tokens=True)
 
     def logprob_span(self, traj: Trajectory, char_s: int, char_e: int) -> torch.Tensor:
         """Differentiable sum of BaseLM log-probs of the gen tokens whose

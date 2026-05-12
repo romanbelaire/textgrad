@@ -42,6 +42,11 @@ _ANSWER_VALUE_RE = re.compile(r"answer\s*[:=]\s*([^\n]+)", re.IGNORECASE)
 _FOUR_DIGIT_RE = re.compile(r"(?<!\d)(\d{4})(?!\d)")
 
 
+def gen_text_has_answer_span_marker(gen_text: str) -> bool:
+    """True iff `AnswerSpanSelector` would find a span without raising (ignoring toy 4-digit fallback)."""
+    return _ANSWER_TAG_RE.search(gen_text) is not None or _ANSWER_VALUE_RE.search(gen_text) is not None
+
+
 class AnswerSpanSelector:
     """Return the char span of the final-answer value in gen_text.
 

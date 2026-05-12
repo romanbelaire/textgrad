@@ -51,6 +51,7 @@ def difftg_step(
     num_spans: int,
     task_idx: int = 0,
     generator: torch.Generator | None = None,
+    traj: Trajectory | None = None,
 ) -> DiffTGResult:
     """Run one inference-time DiffTextGradStep for a single task.
 
@@ -65,7 +66,8 @@ def difftg_step(
             if R(traj') >= R_orig: accept
         return traj, R
     """
-    traj = base_lm.generate(task.prompt)
+    if traj is None:
+        traj = base_lm.generate(task.prompt)
     R_orig = float(reward_fn(traj.gen_text, task))
 
     spans = selector(traj, R_orig, num_spans)

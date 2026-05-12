@@ -4,3 +4,4 @@ outputs/
 hf_api
 .env
 .env.*
+__pycache__/
